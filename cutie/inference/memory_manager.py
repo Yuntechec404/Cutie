@@ -2,6 +2,7 @@ import logging
 from omegaconf import DictConfig
 from typing import List, Dict
 import torch
+import torch.nn as nn
 
 from cutie.inference.object_manager import ObjectManager
 from cutie.inference.kv_memory_store import KeyValueMemoryStore
@@ -109,103 +110,30 @@ class MemoryManager:
 
         return value
 
-    def read(self, pix_feat: torch.Tensor, query_key: torch.Tensor, selection: torch.Tensor,
-             last_mask: torch.Tensor, network: CUTIE) -> Dict[int, torch.Tensor]:
+    def read(self,
+             pix_feat: torch.Tensor,
+             query_key: torch.Tensor,
+             query_selection: torch.Tensor,
+             last_mask: torch.Tensor,
+             network: nn.Module,
+             **kwargs) -> tuple:
         """
-        Read from all memory stores and returns a single memory readout tensor for each object
-
-        pix_feat: (1/2) x C x H x W
-        query_key: (1/2) x C^k x H x W
-        selection:  (1/2) x C^k x H x W
-        last_mask: (1/2) x num_objects x H x W (at stride 16)
-        return a dict of memory readouts, indexed by object indices. Each readout is C*H*W
+        Read from the memory.
+        Returns the memory readout and auxiliary features.
         """
-        h, w = pix_feat.shape[-2:]
-        bs = pix_feat.shape[0]
-        assert query_key.shape[0] == bs
-        assert selection.shape[0] == bs
-        assert last_mask.shape[0] == bs
+        if self.memory_key is None:
+            return None, None
 
-        query_key = query_key.flatten(start_dim=2)  # bs*C^k*HW
-        selection = selection.flatten(start_dim=2)  # bs*C^k*HW
-        """
-        Compute affinity and perform readout
-        """
-        all_readout_mem = {}
-        buckets = self.work_mem.buckets
-        for bucket_id, bucket in buckets.items():
-            if self.use_long_term and self.long_mem.engaged(bucket_id):
-                # Use long-term memory
-                long_mem_size = self.long_mem.size(bucket_id)
-                memory_key = torch.cat([self.long_mem.key[bucket_id], self.work_mem.key[bucket_id]],
-                                       -1)
-                shrinkage = torch.cat(
-                    [self.long_mem.shrinkage[bucket_id], self.work_mem.shrinkage[bucket_id]], -1)
+        sensory = self.get_sensory(self.object_manager.all_obj_ids)
+        selector = self.get_selector(self.object_manager.all_obj_ids)
 
-                similarity = get_similarity(memory_key, shrinkage, query_key, selection)
-                affinity, usage = do_softmax(similarity,
-                                             top_k=self.top_k,
-                                             inplace=True,
-                                             return_usage=True)
-                """
-                Record memory usage for working and long-term memory
-                """
-                # ignore the index return for long-term memory
-                work_usage = usage[:, long_mem_size:]
-                self.work_mem.update_bucket_usage(bucket_id, work_usage)
+        mem_readout, aux_output = network.read_memory(
+            query_key, query_selection, self.memory_key, self.memory_shrinkage,
+            self.memory_value, self.obj_memory, pix_feat, sensory, last_mask, selector,
+            **kwargs
+        )
 
-                if self.count_long_term_usage:
-                    # ignore the index return for working memory
-                    long_usage = usage[:, :long_mem_size]
-                    self.long_mem.update_bucket_usage(bucket_id, long_usage)
-            else:
-                # no long-term memory
-                memory_key = self.work_mem.key[bucket_id]
-                shrinkage = self.work_mem.shrinkage[bucket_id]
-                similarity = get_similarity(memory_key, shrinkage, query_key, selection)
-
-                if self.use_long_term:
-                    affinity, usage = do_softmax(similarity,
-                                                 top_k=self.top_k,
-                                                 inplace=True,
-                                                 return_usage=True)
-                    self.work_mem.update_bucket_usage(bucket_id, usage)
-                else:
-                    affinity = do_softmax(similarity, top_k=self.top_k, inplace=True)
-
-            if self.chunk_size < 1:
-                object_chunks = [bucket]
-            else:
-                object_chunks = [
-                    bucket[i:i + self.chunk_size] for i in range(0, len(bucket), self.chunk_size)
-                ]
-
-            for objects in object_chunks:
-                this_sensory = self._get_sensory_by_ids(objects)
-                this_last_mask = self._get_mask_by_ids(last_mask, objects)
-                this_msk_value = self._get_visual_values_by_ids(objects)  # (1/2)*num_objects*C*N
-                visual_readout = self._readout(affinity,
-                                               this_msk_value).view(bs, len(objects), self.CV, h, w)
-                pixel_readout = network.pixel_fusion(pix_feat, visual_readout, this_sensory,
-                                                     this_last_mask)
-                this_obj_mem = self._get_object_mem_by_ids(objects)
-                this_obj_mem = this_obj_mem.unsqueeze(2) if this_obj_mem is not None else None
-                readout_memory, aux_features = network.readout_query(pixel_readout, this_obj_mem)
-                for i, obj in enumerate(objects):
-                    all_readout_mem[obj] = readout_memory[:, i]
-
-                if self.save_aux:
-                    aux_output = {
-                        'sensory': this_sensory,
-                        'pixel_readout': pixel_readout,
-                        'q_logits': aux_features['logits'] if aux_features else None,
-                        'q_weights': aux_features['q_weights'] if aux_features else None,
-                        'p_weights': aux_features['p_weights'] if aux_features else None,
-                        'attn_mask': aux_features['attn_mask'].float() if aux_features else None,
-                    }
-                    self.aux = aux_output
-
-        return all_readout_mem
+        return mem_readout, aux_output
 
     def add_memory(self,
                    key: torch.Tensor,

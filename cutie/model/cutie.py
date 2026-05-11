@@ -106,47 +106,50 @@ class CUTIE(nn.Module):
                     msk_value: torch.Tensor, obj_memory: torch.Tensor, pix_feat: torch.Tensor,
                     sensory: torch.Tensor, last_mask: torch.Tensor,
                     selector: torch.Tensor,
-                    use_depth_warp: bool = False,
+                    # --- [新增] 運動學參數 ---
+                    use_depth_warp: bool = False, 
                     depth_map: Optional[torch.Tensor] = None, 
                     prev_depth_map: Optional[torch.Tensor] = None,
                     intrinsics: Optional[torch.Tensor] = None, 
-                    se3_matrix: Optional[torch.Tensor] = None
-                    ) -> (torch.Tensor, Dict[str, torch.Tensor]):
+                    se3_matrix: Optional[torch.Tensor] = None,
+                    use_explicit_shift: bool = False, 
+                    pixel_shift_uv: Optional[torch.Tensor] = None
+                    ) -> tuple:
         
         batch_size, num_objects = msk_value.shape[:2]
 
-        # 只有在 use_depth_warp 為 True 且資料不為空時才啟動
+        # =================================================================
+        # Kinematics-Guided Depth-Aware Feature Warping
+        # =================================================================
         if use_depth_warp and (depth_map is not None) and (se3_matrix is not None) and (intrinsics is not None):
             B, CK, T, H, W = memory_key.shape
             
-            # 過濾與降採樣
-            filtered_depth, valid_mask = filter_realsense_depth(depth_map, prev_depth_map)
+            filtered_depth, _ = filter_realsense_depth(depth_map, prev_depth_map)
             depth_down = F.interpolate(filtered_depth, size=(H, W), mode='nearest')
             
+            if se3_matrix.dim() == 3: # (B, 4, 4)
+                se3_matrix_T = se3_matrix.repeat_interleave(T, dim=0)
+            else:
+                se3_matrix_T = se3_matrix.view(B*T, 4, 4) 
+                
             depth_down_T = depth_down.repeat_interleave(T, dim=0)
             intrinsics_T = intrinsics.repeat_interleave(T, dim=0)
-            se3_matrix_T = se3_matrix.repeat_interleave(T, dim=0)
             
+            # Warp Memory Key
             memory_key_flat = memory_key.transpose(1, 2).reshape(B*T, CK, H, W)
             warped_memory_key, grid = depth_aware_warp(
-                feature_map=memory_key_flat, 
-                depth=depth_down_T, 
-                intrinsics=intrinsics_T, 
-                se3_matrix=se3_matrix_T,
-                stride=16  # 告訴 Utils 這是 1/16 的特徵圖
+                memory_key_flat, depth_down_T, intrinsics_T, se3_matrix_T, stride=16
             )
             memory_key = warped_memory_key.view(B, T, CK, H, W).transpose(1, 2)
             
+            # Warp Mask Value
             CV = msk_value.shape[2]
-            msk_value_permuted = msk_value.permute(0, 3, 1, 2, 4, 5) # B, T, num_obj, CV, H, W
+            msk_value_permuted = msk_value.permute(0, 3, 1, 2, 4, 5) # (B, T, num_obj, CV, H, W)
             msk_value_flat = msk_value_permuted.reshape(B*T, num_objects*CV, H, W)
             
-            # 共用同一組 grid，確保空間特徵對齊
             msk_value_warped = F.grid_sample(msk_value_flat, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-            
-            # 安全地還原形狀
             msk_value = msk_value_warped.view(B, T, num_objects, CV, H, W).permute(0, 2, 3, 1, 4, 5)
-        # =====================================================================
+        # =================================================================
 
         # read using visual attention
         with torch.cuda.amp.autocast(enabled=False):
@@ -155,14 +158,17 @@ class CUTIE(nn.Module):
 
             msk_value = msk_value.flatten(start_dim=1, end_dim=2).float()
 
-            # B * (num_objects*CV) * H * W
             pixel_readout = readout(affinity, msk_value)
             pixel_readout = pixel_readout.view(batch_size, num_objects, self.value_dim,
                                                *pixel_readout.shape[-2:])
+            
         pixel_readout = self.pixel_fusion(pix_feat, pixel_readout, sensory, last_mask)
 
-        # read from query transformer
-        mem_readout, aux_features = self.readout_query(pixel_readout, obj_memory, selector=selector)
+        # 傳遞 explicit_shift 給 transformer
+        mem_readout, aux_features = self.readout_query(
+            pixel_readout, obj_memory, selector=selector,
+            use_explicit_shift=use_explicit_shift, pixel_shift_uv=pixel_shift_uv
+        )
 
         aux_output = {
             'sensory': sensory,
@@ -189,18 +195,14 @@ class CUTIE(nn.Module):
                                  chunk_size=chunk_size)
         return fused
 
-    def readout_query(self,
-                      pixel_readout,
-                      obj_memory,
-                      *,
-                      selector=None,
-                      need_weights=False) -> (torch.Tensor, Dict[str, torch.Tensor]):
+    def readout_query(self, pixel_readout, obj_memory, *, selector=None, need_weights=False,
+                      use_explicit_shift=False, pixel_shift_uv=None):
         if not self.object_transformer_enabled:
             return pixel_readout, None
-        return self.object_transformer(pixel_readout,
-                                       obj_memory,
-                                       selector=selector,
-                                       need_weights=need_weights)
+        return self.object_transformer(
+            pixel_readout, obj_memory, selector=selector, need_weights=need_weights,
+            use_explicit_shift=use_explicit_shift, pixel_shift_uv=pixel_shift_uv
+        )
 
     def segment(self,
                 ms_image_feat: List[torch.Tensor],

@@ -121,54 +121,24 @@ class InferenceCore:
         if is_deep_update:
             self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
 
-    def _segment(self,
-                 key: torch.Tensor,
-                 selection: torch.Tensor,
-                 pix_feat: torch.Tensor,
-                 ms_features: Iterable[torch.Tensor],
-                 update_sensory: bool = True) -> torch.Tensor:
-        """
-        Produce a segmentation using the given features and the memory
+    def _segment(self, key, selection, pix_feat, ms_features, 
+                 update_sensory=True, kinematics_data=None):
+        # 準備 kwargs 傳遞給 MemoryManager
+        kwargs = kinematics_data if kinematics_data is not None else {}
+        
+        memory_readout, aux_output = self.memory.read(pix_feat, key, selection,
+                                                      self.last_mask, self.network, **kwargs)
+        if memory_readout is None:
+            return None
 
-        The batch dimension is 1 if flip augmentation is not used.
-        key/selection: for anisotropic l2: (1/2) * _ * H * W
-        pix_feat: from the key encoder, (1/2) * _ * H * W
-        ms_features: an iterable of multiscale features from the encoder, each is (1/2)*_*H*W
-                      with strides 16, 8, and 4 respectively
-        update_sensory: whether to update the sensory memory
+        sensory, _, attn_mask = self.network.segment(ms_features, memory_readout,
+                                                     self.object_manager.get_sensory_pointers(),
+                                                     aux_output)
 
-        Returns: (num_objects+1)*H*W normalized probability; the first channel is the background
-        """
-        bs = key.shape[0]
-        if self.flip_aug:
-            assert bs == 2
-        else:
-            assert bs == 1
-
-        if not self.memory.engaged:
-            log.warn('Trying to segment without any memory!')
-            return torch.zeros((1, key.shape[-2] * 16, key.shape[-1] * 16),
-                               device=key.device,
-                               dtype=key.dtype)
-
-        memory_readout = self.memory.read(pix_feat, key, selection, self.last_mask, self.network)
-        memory_readout = self.object_manager.realize_dict(memory_readout)
-        sensory, _, pred_prob_with_bg = self.network.segment(ms_features,
-                                                             memory_readout,
-                                                             self.memory.get_sensory(
-                                                                 self.object_manager.all_obj_ids),
-                                                             chunk_size=self.chunk_size,
-                                                             update_sensory=update_sensory)
-        # remove batch dim
-        if self.flip_aug:
-            # average predictions of the non-flipped and flipped version
-            pred_prob_with_bg = (pred_prob_with_bg[0] +
-                                 torch.flip(pred_prob_with_bg[1], dims=[-1])) / 2
-        else:
-            pred_prob_with_bg = pred_prob_with_bg[0]
         if update_sensory:
             self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
-        return pred_prob_with_bg
+
+        return self.network.get_prob_with_bg(sensory, self.object_manager.get_sensory_pointers())
 
     def step(self,
              image: torch.Tensor,
@@ -180,206 +150,116 @@ class InferenceCore:
              delete_buffer: bool = True,
              force_permanent: bool = False,
              use_kinematics_memory: bool = False,
-             kinematics_data: Optional[Dict[str, any]] = None
-             ) -> torch.Tensor:
+             kinematics_data: Optional[Dict[str, any]] = None) -> torch.Tensor:
         """
-        Take a step with a new incoming image.
-        If there is an incoming mask with new objects, we will memorize them.
-        If there is no incoming mask, we will segment the image using the memory.
-        In both cases, we will update the memory and return a segmentation.
-
-        image: 3*H*W
-        mask: H*W (if idx mask) or len(objects)*H*W or None
-        objects: list of object ids that are valid in the mask Tensor.
-                The ids themselves do not need to be consecutive/in order, but they need to be 
-                in the same position in the list as the corresponding mask
-                in the tensor in non-idx-mask mode.
-                objects is ignored if the mask is None. 
-                If idx_mask is False and objects is None, we sequentially infer the object ids.
-        idx_mask: if True, mask is expected to contain an object id at every pixel.
-                  If False, mask should have multiple channels with each channel representing one object.
-        end: if we are at the end of the sequence, we do not need to update memory
-            if unsure just set it to False 
-        delete_buffer: whether to delete the image feature buffer after this step
-        force_permanent: the memory recorded this frame will be added to the permanent memory
+        Take a step with a new image.
         """
-        if objects is None and mask is not None:
-            assert not idx_mask
-            objects = list(range(1, mask.shape[0] + 1))
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
 
-        # resize input if needed -- currently only used for the GUI
-        resize_needed = False
-        if self.max_internal_size > 0:
-            h, w = image.shape[-2:]
-            min_side = min(h, w)
-            if min_side > self.max_internal_size:
-                resize_needed = True
-                new_h = int(h / min_side * self.max_internal_size)
-                new_w = int(w / min_side * self.max_internal_size)
-                image = F.interpolate(image.unsqueeze(0),
-                                      size=(new_h, new_w),
-                                      mode='bilinear',
-                                      align_corners=False)[0]
-                if mask is not None:
-                    if idx_mask:
-                        mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0).float(),
-                                             size=(new_h, new_w),
-                                             mode='nearest-exact')[0, 0].round().long()
-                    else:
-                        mask = F.interpolate(mask.unsqueeze(0),
-                                             size=(new_h, new_w),
-                                             mode='bilinear',
-                                             align_corners=False)[0]
-
+        image, self.pad = pad_divide_by(image, 16)
+        image = image.to(self.device)
         self.curr_ti += 1
 
+        # =================================================================
+        # 動態運動學記憶體與模糊偵測 (ODE Physics Update)
+        # =================================================================
         dynamic_mem_every = self.mem_every
         is_motion_blur = False
-
+        
         if use_kinematics_memory and kinematics_data is not None:
             vel = kinematics_data.get('velocity', 0.0)
             ang_vel = kinematics_data.get('angular_velocity', 0.0)
             
+            # 定義動態閾值 (可依機器人規格調整)
             BLUR_V_THRESH, BLUR_W_THRESH = 1.5, 1.0
             STATIC_V_THRESH, STATIC_W_THRESH = 0.1, 0.05
             
             if vel > BLUR_V_THRESH or ang_vel > BLUR_W_THRESH:
                 is_motion_blur = True
             elif vel < STATIC_V_THRESH and ang_vel < STATIC_W_THRESH:
-                dynamic_mem_every = self.mem_every * 3
+                dynamic_mem_every = max(self.mem_every * 3, 15)
 
-        # 更新判定邏輯
         is_mem_frame = ((self.curr_ti - self.last_mem_ti >= dynamic_mem_every) or
                         (mask is not None)) and (not end)
         
-        # 如果啟用動態記憶體且發生模糊，執行 ODE 物理補償
+        # 啟動 Zero-Shot ODE 物理狀態推演
         if use_kinematics_memory and is_motion_blur and mask is None:
             is_mem_frame = False
             update_sensory = False
             
-            if 'depth_map' in kinematics_data and 'se3_matrix' in kinematics_data:
+            if kinematics_data and 'depth_map' in kinematics_data and 'se3_matrix' in kinematics_data:
                 current_sensory = self.memory.get_sensory(self.object_manager.all_obj_ids)
-                _, C, H_feat, W_feat = current_sensory.shape
-                
-                # 確保深度圖被降採樣到特徵圖的大小
-                depth_down = F.interpolate(kinematics_data['depth_map'], size=(H_feat, W_feat), mode='nearest')
-                
-                warped_sensory, _ = depth_aware_warp(
-                    feature_map=current_sensory,
-                    depth=depth_down,
-                    intrinsics=kinematics_data['intrinsics'],
-                    se3_matrix=kinematics_data['se3_matrix'],
-                    stride=16
-                )
-                self.memory.update_sensory(warped_sensory, self.object_manager.all_obj_ids)
+                if current_sensory is not None:
+                    num_obj, C_sensory, H_feat, W_feat = current_sensory.shape
+                    
+                    depth_down = F.interpolate(kinematics_data['depth_map'], size=(H_feat, W_feat), mode='nearest')
+                    
+                    # 擴展 Batch Size 以匹配當前追蹤物件數量
+                    depth_rep = depth_down.repeat(num_obj, 1, 1, 1)
+                    intrinsics_rep = kinematics_data['intrinsics'].repeat(num_obj, 1, 1)
+                    se3_rep = kinematics_data['se3_matrix'].repeat(num_obj, 1, 1)
+                    
+                    warped_sensory, _ = depth_aware_warp(
+                        feature_map=current_sensory, depth=depth_rep,
+                        intrinsics=intrinsics_rep, se3_matrix=se3_rep, stride=16
+                    )
+                    self.memory.update_sensory(warped_sensory, self.object_manager.all_obj_ids)
             
-            # 提早返回時，正確重建具備背景通道與解鎖 Padding 的 Prob Mask
-            pred_prob_no_bg = self.last_mask[0] # [num_objects, H, W]
-            bg_prob = 1.0 - pred_prob_no_bg.sum(dim=0, keepdim=True) # 計算背景機率
+            # 直接提取推演後的 last_mask，重建背景通道後提早返回
+            pred_prob_no_bg = self.last_mask[0] # (num_objects, H, W)
+            bg_prob = torch.clamp(1.0 - pred_prob_no_bg.sum(dim=0, keepdim=True), min=0.0)
             pred_prob_with_bg = torch.cat([bg_prob, pred_prob_no_bg], dim=0)
             
             output_prob = unpad(pred_prob_with_bg, self.pad)
-            
-            # 如果有經過前置 Resize，要 Resize 回原圖大小
-            if resize_needed:
-                output_prob = F.interpolate(output_prob.unsqueeze(0),
-                                            size=(h, w),
-                                            mode='bilinear',
-                                            align_corners=False)[0]
-            
             return output_prob
+        else:
+            update_sensory = ((self.curr_ti - self.last_mem_ti) in self.stagger_ti) and (not end)
+        # =================================================================
 
-        # whether to update the working memory
-        is_mem_frame = ((self.curr_ti - self.last_mem_ti >= self.mem_every) or
-                        (mask is not None)) and (not end)
-        # segment when there is no input mask or when the input mask is incomplete
-        need_segment = (mask is None) or (self.object_manager.num_obj > 0
-                                          and not self.object_manager.has_all(objects))
-        update_sensory = ((self.curr_ti - self.last_mem_ti) in self.stagger_ti) and (not end)
-
-        # encoding the image
+        # extract features
+        need_segment = (self.object_manager.num_obj > 0)
         ms_feat, pix_feat = self.image_feature_store.get_features(self.curr_ti, image)
         key, shrinkage, selection = self.image_feature_store.get_key(self.curr_ti, image)
 
-        # segmentation from memory if needed
-        if need_segment:
-            pred_prob_with_bg = self._segment(key,
-                                              selection,
-                                              pix_feat,
-                                              ms_feat,
-                                              update_sensory=update_sensory)
-
-        # use the input mask if provided
+        # extract mask/update memory
         if mask is not None:
-            # inform the manager of the new objects, and get a list of temporary id
-            # temporary ids -- indicates the position of objects in the tensor
-            # (starts with 1 due to the background channel)
-            corresponding_tmp_ids, _ = self.object_manager.add_new_objects(objects)
-
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0)
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(0)
             mask, _ = pad_divide_by(mask, 16)
-            if need_segment:
-                # merge predicted mask with the incomplete input mask
-                pred_prob_no_bg = pred_prob_with_bg[1:]
-                # use the mutual exclusivity of segmentation
-                if idx_mask:
-                    pred_prob_no_bg[:, mask > 0] = 0
-                else:
-                    pred_prob_no_bg[:, mask.max(0) > 0.5] = 0
+            if self.flip_aug:
+                mask = mask.flip(3)
+            self.object_manager.add_new_objects(mask, objects, idx_mask=idx_mask)
+            self.last_mask = self.object_manager.construct_all_tmp_masks(mask, idx_mask=idx_mask)
+            need_segment = True
+            is_mem_frame = True
 
-                new_masks = []
-                for mask_id, tmp_id in enumerate(corresponding_tmp_ids):
-                    if idx_mask:
-                        this_mask = (mask == objects[mask_id]).type_as(pred_prob_no_bg)
-                    else:
-                        this_mask = mask[tmp_id]
-                    if tmp_id > pred_prob_no_bg.shape[0]:
-                        new_masks.append(this_mask.unsqueeze(0))
-                    else:
-                        # +1 for padding the background channel
-                        pred_prob_no_bg[tmp_id - 1] = this_mask
-                # new_masks are always in the order of tmp_id
-                mask = torch.cat([pred_prob_no_bg, *new_masks], dim=0)
-            elif idx_mask:
-                # simply convert cls to one-hot representation
-                if len(objects) == 0:
-                    if delete_buffer:
-                        self.image_feature_store.delete(self.curr_ti)
-                    log.warn('Trying to insert an empty mask as memory!')
-                    return torch.zeros((1, key.shape[-2] * 16, key.shape[-1] * 16),
-                                       device=key.device,
-                                       dtype=key.dtype)
-                mask = torch.stack(
-                    [mask == objects[mask_id] for mask_id, _ in enumerate(corresponding_tmp_ids)],
-                    dim=0)
-            pred_prob_with_bg = aggregate(mask, dim=0)
-            pred_prob_with_bg = torch.softmax(pred_prob_with_bg, dim=0)
+        pred_prob_with_bg = None
+        if need_segment:
+            pred_prob_with_bg = self._segment(key, selection, pix_feat, ms_feat, 
+                                              update_sensory=update_sensory, 
+                                              kinematics_data=kinematics_data)
 
-        self.last_mask = pred_prob_with_bg[1:].unsqueeze(0)
-        if self.flip_aug:
-            self.last_mask = torch.cat(
-                [self.last_mask, torch.flip(self.last_mask, dims=[-1])], dim=0)
+        if pred_prob_with_bg is None:
+            pred_prob_with_bg = torch.zeros((1, key.shape[-2], key.shape[-1]),
+                                            dtype=torch.float32,
+                                            device=self.device)
+            pred_prob_with_bg[0] = 1
+
+        if mask is None:
+            self.last_mask = pred_prob_with_bg[1:].unsqueeze(0)
 
         # save as memory if needed
         if is_mem_frame or force_permanent:
-            self._add_memory(image,
-                             pix_feat,
-                             self.last_mask,
-                             key,
-                             shrinkage,
-                             selection,
+            self._add_memory(image, pix_feat, self.last_mask, key, shrinkage, selection,
                              force_permanent=force_permanent)
 
         if delete_buffer:
             self.image_feature_store.delete(self.curr_ti)
 
         output_prob = unpad(pred_prob_with_bg, self.pad)
-        if resize_needed:
-            # restore output to the original size
-            output_prob = F.interpolate(output_prob.unsqueeze(0),
-                                        size=(h, w),
-                                        mode='bilinear',
-                                        align_corners=False)[0]
-
         return output_prob
 
     def delete_objects(self, objects: List[int]) -> None:
