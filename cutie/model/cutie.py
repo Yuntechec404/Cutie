@@ -1,8 +1,9 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 import logging
 from omegaconf import DictConfig
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from cutie.model.modules import *
 from cutie.model.big_modules import *
@@ -11,6 +12,7 @@ from cutie.model.utils.memory_utils import *
 from cutie.model.transformer.object_transformer import QueryTransformer
 from cutie.model.transformer.object_summarizer import ObjectSummarizer
 from cutie.utils.tensor_utils import aggregate
+from cutie.utils.kinematics_utils import depth_aware_warp, filter_realsense_depth
 
 log = logging.getLogger()
 
@@ -103,17 +105,48 @@ class CUTIE(nn.Module):
                     memory_key: torch.Tensor, memory_shrinkage: torch.Tensor,
                     msk_value: torch.Tensor, obj_memory: torch.Tensor, pix_feat: torch.Tensor,
                     sensory: torch.Tensor, last_mask: torch.Tensor,
-                    selector: torch.Tensor) -> (torch.Tensor, Dict[str, torch.Tensor]):
-        """
-        query_key       : B * CK * H * W
-        query_selection : B * CK * H * W
-        memory_key      : B * CK * T * H * W
-        memory_shrinkage: B * 1  * T * H * W
-        msk_value       : B * num_objects * CV * T * H * W
-        obj_memory      : B * num_objects * T * num_summaries * C
-        pixel_feature   : B * C * H * W
-        """
+                    selector: torch.Tensor,
+                    use_depth_warp: bool = False,
+                    depth_map: Optional[torch.Tensor] = None, 
+                    prev_depth_map: Optional[torch.Tensor] = None,
+                    intrinsics: Optional[torch.Tensor] = None, 
+                    se3_matrix: Optional[torch.Tensor] = None
+                    ) -> (torch.Tensor, Dict[str, torch.Tensor]):
+        
         batch_size, num_objects = msk_value.shape[:2]
+
+        # 只有在 use_depth_warp 為 True 且資料不為空時才啟動
+        if use_depth_warp and (depth_map is not None) and (se3_matrix is not None) and (intrinsics is not None):
+            B, CK, T, H, W = memory_key.shape
+            
+            # 過濾與降採樣
+            filtered_depth, valid_mask = filter_realsense_depth(depth_map, prev_depth_map)
+            depth_down = F.interpolate(filtered_depth, size=(H, W), mode='nearest')
+            
+            depth_down_T = depth_down.repeat_interleave(T, dim=0)
+            intrinsics_T = intrinsics.repeat_interleave(T, dim=0)
+            se3_matrix_T = se3_matrix.repeat_interleave(T, dim=0)
+            
+            memory_key_flat = memory_key.transpose(1, 2).reshape(B*T, CK, H, W)
+            warped_memory_key, grid = depth_aware_warp(
+                feature_map=memory_key_flat, 
+                depth=depth_down_T, 
+                intrinsics=intrinsics_T, 
+                se3_matrix=se3_matrix_T,
+                stride=16  # 告訴 Utils 這是 1/16 的特徵圖
+            )
+            memory_key = warped_memory_key.view(B, T, CK, H, W).transpose(1, 2)
+            
+            CV = msk_value.shape[2]
+            msk_value_permuted = msk_value.permute(0, 3, 1, 2, 4, 5) # B, T, num_obj, CV, H, W
+            msk_value_flat = msk_value_permuted.reshape(B*T, num_objects*CV, H, W)
+            
+            # 共用同一組 grid，確保空間特徵對齊
+            msk_value_warped = F.grid_sample(msk_value_flat, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+            
+            # 安全地還原形狀
+            msk_value = msk_value_warped.view(B, T, num_objects, CV, H, W).permute(0, 2, 3, 1, 4, 5)
+        # =====================================================================
 
         # read using visual attention
         with torch.cuda.amp.autocast(enabled=False):

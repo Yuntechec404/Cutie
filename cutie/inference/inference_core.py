@@ -11,6 +11,7 @@ from cutie.inference.object_manager import ObjectManager
 from cutie.inference.image_feature_store import ImageFeatureStore
 from cutie.model.cutie import CUTIE
 from cutie.utils.tensor_utils import pad_divide_by, unpad, aggregate
+from cutie.utils.kinematics_utils import depth_aware_warp, filter_realsense_depth
 
 log = logging.getLogger()
 
@@ -177,7 +178,10 @@ class InferenceCore:
              idx_mask: bool = True,
              end: bool = False,
              delete_buffer: bool = True,
-             force_permanent: bool = False) -> torch.Tensor:
+             force_permanent: bool = False,
+             use_kinematics_memory: bool = False,
+             kinematics_data: Optional[Dict[str, any]] = None
+             ) -> torch.Tensor:
         """
         Take a step with a new incoming image.
         If there is an incoming mask with new objects, we will memorize them.
@@ -229,10 +233,61 @@ class InferenceCore:
 
         self.curr_ti += 1
 
-        image, self.pad = pad_divide_by(image, 16)
-        image = image.unsqueeze(0)  # add the batch dimension
-        if self.flip_aug:
-            image = torch.cat([image, torch.flip(image, dims=[-1])], dim=0)
+        dynamic_mem_every = self.mem_every
+        is_motion_blur = False
+
+        if use_kinematics_memory and kinematics_data is not None:
+            vel = kinematics_data.get('velocity', 0.0)
+            ang_vel = kinematics_data.get('angular_velocity', 0.0)
+            
+            BLUR_V_THRESH, BLUR_W_THRESH = 1.5, 1.0
+            STATIC_V_THRESH, STATIC_W_THRESH = 0.1, 0.05
+            
+            if vel > BLUR_V_THRESH or ang_vel > BLUR_W_THRESH:
+                is_motion_blur = True
+            elif vel < STATIC_V_THRESH and ang_vel < STATIC_W_THRESH:
+                dynamic_mem_every = self.mem_every * 3
+
+        # 更新判定邏輯
+        is_mem_frame = ((self.curr_ti - self.last_mem_ti >= dynamic_mem_every) or
+                        (mask is not None)) and (not end)
+        
+        # 如果啟用動態記憶體且發生模糊，執行 ODE 物理補償
+        if use_kinematics_memory and is_motion_blur and mask is None:
+            is_mem_frame = False
+            update_sensory = False
+            
+            if 'depth_map' in kinematics_data and 'se3_matrix' in kinematics_data:
+                current_sensory = self.memory.get_sensory(self.object_manager.all_obj_ids)
+                _, C, H_feat, W_feat = current_sensory.shape
+                
+                # 確保深度圖被降採樣到特徵圖的大小
+                depth_down = F.interpolate(kinematics_data['depth_map'], size=(H_feat, W_feat), mode='nearest')
+                
+                warped_sensory, _ = depth_aware_warp(
+                    feature_map=current_sensory,
+                    depth=depth_down,
+                    intrinsics=kinematics_data['intrinsics'],
+                    se3_matrix=kinematics_data['se3_matrix'],
+                    stride=16
+                )
+                self.memory.update_sensory(warped_sensory, self.object_manager.all_obj_ids)
+            
+            # 提早返回時，正確重建具備背景通道與解鎖 Padding 的 Prob Mask
+            pred_prob_no_bg = self.last_mask[0] # [num_objects, H, W]
+            bg_prob = 1.0 - pred_prob_no_bg.sum(dim=0, keepdim=True) # 計算背景機率
+            pred_prob_with_bg = torch.cat([bg_prob, pred_prob_no_bg], dim=0)
+            
+            output_prob = unpad(pred_prob_with_bg, self.pad)
+            
+            # 如果有經過前置 Resize，要 Resize 回原圖大小
+            if resize_needed:
+                output_prob = F.interpolate(output_prob.unsqueeze(0),
+                                            size=(h, w),
+                                            mode='bilinear',
+                                            align_corners=False)[0]
+            
+            return output_prob
 
         # whether to update the working memory
         is_mem_frame = ((self.curr_ti - self.last_mem_ti >= self.mem_every) or

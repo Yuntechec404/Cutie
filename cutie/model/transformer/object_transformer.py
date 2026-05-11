@@ -115,7 +115,10 @@ class QueryTransformer(nn.Module):
                 pixel: torch.Tensor,
                 obj_summaries: torch.Tensor,
                 selector: Optional[torch.Tensor] = None,
-                need_weights: bool = False) -> (torch.Tensor, Dict[str, torch.Tensor]):
+                need_weights: bool = False,
+                use_explicit_shift: bool = False,
+                pixel_shift_uv: Optional[torch.Tensor] = None
+                ) -> (torch.Tensor, Dict[str, torch.Tensor]):
         # pixel: B*num_objects*embed_dim*H*W
         # obj_summaries: B*num_objects*T*num_queries*embed_dim
         T = obj_summaries.shape[2]
@@ -141,6 +144,15 @@ class QueryTransformer(nn.Module):
         pixel_init = self.pixel_init_proj(pixel)
         pixel_emb = self.pixel_emb_proj(pixel)
         pixel_pe = self.spatial_pe(pixel.flatten(0, 1))
+        
+        # use_explicit_shift 為 True 時才平移位置編碼
+        if use_explicit_shift and (pixel_shift_uv is not None):
+            du = int(pixel_shift_uv[0, 0].item())
+            dv = int(pixel_shift_uv[0, 1].item())
+            
+            # 執行反向平移
+            pixel_pe_spatial = torch.roll(pixel_pe_spatial, shifts=(dv, du), dims=(2, 3))
+
         pixel_emb = pixel_emb.flatten(3, 4).flatten(0, 1).transpose(1, 2).contiguous()
         pixel_pe = pixel_pe.flatten(1, 2) + pixel_emb
 
