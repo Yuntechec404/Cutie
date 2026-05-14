@@ -117,63 +117,93 @@ class QueryTransformer(nn.Module):
                 selector: Optional[torch.Tensor] = None,
                 need_weights: bool = False,
                 use_explicit_shift: bool = False, 
-                pixel_shift_uv: Optional[torch.Tensor] = None) -> tuple:
+                pixel_shift_uv: Optional[torch.Tensor] = None) -> (torch.Tensor, Dict[str, torch.Tensor]):
         
-        bs, num_objects = obj_summaries.shape[:2]
-        obj_values = obj_summaries.flatten(0, 1)
+        # pixel: B*num_objects*embed_dim*H*W
+        # obj_summaries: B*num_objects*T*num_queries*embed_dim
+        T = obj_summaries.shape[2]
+        bs, num_objects, _, H, W = pixel.shape
 
+        obj_summaries = obj_summaries.view(bs * num_objects, T, self.num_queries,
+                                           self.embed_dim + 1)
+        obj_sums = obj_summaries[:, :, :, :-1].sum(dim=1)
+        obj_area = obj_summaries[:, :, :, -1:].sum(dim=1)
+        obj_values = obj_sums / (obj_area + 1e-4)
+        
         obj_init = self.summary_to_query_init(obj_values)
         obj_emb = self.summary_to_query_emb(obj_values)
 
+        # positional embeddings for object queries
         query = self.query_init.weight.unsqueeze(0).expand(bs * num_objects, -1, -1) + obj_init
         query_emb = self.query_emb.weight.unsqueeze(0).expand(bs * num_objects, -1, -1) + obj_emb
 
+        # positional embeddings for pixel features
         pixel_init = self.pixel_init_proj(pixel)
         pixel_emb = self.pixel_emb_proj(pixel)
         
-        # 取得空間位置編碼
+        # spatial_pe 產出的形狀是 (bs*num_objects, H, W, C)
         pixel_pe_spatial = self.spatial_pe(pixel.flatten(0, 1))
 
-        # =================================================================
-        # Trajectory-Aware Explicit 2D Shift
-        # 利用 Affine_grid 對空間位置編碼進行無幽靈疊影 (Ghost-free) 的平移
-        # =================================================================
+        # [我們的創新] Trajectory-Aware Explicit 2D Shift
         if use_explicit_shift and (pixel_shift_uv is not None):
             du = pixel_shift_uv[0, 0].item()
             dv = pixel_shift_uv[0, 1].item()
-            B_obj, C_pe, H_pe, W_pe = pixel_pe_spatial.shape
             
-            # 計算正規化平移量 [-1, 1]。注意反向平移 (-)
+            # 正確解析 (B, H, W, C)
+            B_obj, H_pe, W_pe, C_pe = pixel_pe_spatial.shape 
+            
+            # 安全轉換為 grid_sample 所需的 (B, C, H, W)
+            pe_for_grid = pixel_pe_spatial.permute(0, 3, 1, 2)
+            
             tx = -du / (W_pe / 2.0)
             ty = -dv / (H_pe / 2.0)
-            
-            # 建立 Affine 平移矩陣
             translation_matrix = torch.tensor([
                 [1.0, 0.0, tx],
                 [0.0, 1.0, ty]
             ], device=pixel_pe_spatial.device, dtype=torch.float32).unsqueeze(0).repeat(B_obj, 1, 1)
             
-            # 產生採樣網格並套用 (padding_mode='zeros' 填零補齊)
-            grid = F.affine_grid(translation_matrix, pixel_pe_spatial.size(), align_corners=True)
-            pixel_pe_spatial = F.grid_sample(pixel_pe_spatial, grid, align_corners=True, padding_mode='zeros')
+            import torch.nn.functional as F_nn
+            grid = F_nn.affine_grid(translation_matrix, pe_for_grid.size(), align_corners=True)
+            pe_shifted = F_nn.grid_sample(pe_for_grid, grid, align_corners=True, padding_mode='zeros')
+            
+            # 再安全轉換回原生的 (B, H, W, C)
+            pixel_pe_spatial = pe_shifted.permute(0, 2, 3, 1)
         # =================================================================
 
         pixel_emb = pixel_emb.flatten(3, 4).flatten(0, 1).transpose(1, 2).contiguous()
         pixel_pe = pixel_pe_spatial.flatten(1, 2) + pixel_emb
-        pixel_init = pixel_init.flatten(3, 4).flatten(0, 1).transpose(1, 2).contiguous()
 
-        aux_features = {}
-        for block in self.blocks:
-            query, pixel_init, aux_features = block(query, query_emb, pixel_init, pixel_pe,
-                                                    selector, need_weights)
+        # 🐛 [關鍵修復] 保留 pixel 為 5D 張量，不提早展平！
+        pixel = pixel_init
 
-        # read from query
-        pixel = self.read_from_query(pixel_init, pixel_pe, query, query_emb, selector)
-        pixel = self.ffn(pixel) + pixel
+        # run the transformer
+        aux_features = {'logits': []}
 
-        pixel = pixel.transpose(1, 2).contiguous().view(bs, num_objects, self.embed_dim,
-                                                        pixel_pe_spatial.shape[-2],
-                                                        pixel_pe_spatial.shape[-1])
+        # first aux output
+        aux_logits = self.mask_pred[0](pixel).squeeze(2)
+        attn_mask = self._get_aux_mask(aux_logits, selector)
+        aux_features['logits'].append(aux_logits)
+        for i in range(self.num_blocks):
+            query, pixel, q_weights, p_weights = self.blocks[i](query,
+                                                                pixel,
+                                                                query_emb,
+                                                                pixel_pe,
+                                                                attn_mask,
+                                                                need_weights=need_weights)
+
+            if self.training or i <= self.num_blocks - 1 or need_weights:
+                aux_logits = self.mask_pred[i + 1](pixel).squeeze(2)
+                attn_mask = self._get_aux_mask(aux_logits, selector)
+                aux_features['logits'].append(aux_logits)
+
+        aux_features['q_weights'] = q_weights  # last layer only
+        aux_features['p_weights'] = p_weights  # last layer only
+
+        if self.training:
+            # no need to save all heads
+            aux_features['attn_mask'] = attn_mask.view(bs, num_objects, self.num_heads,
+                                                       self.num_queries, H, W)[:, :, 0]
+
         return pixel, aux_features
 
     def _get_aux_mask(self, logits: torch.Tensor, selector: torch.Tensor) -> torch.Tensor:

@@ -3,6 +3,7 @@ from omegaconf import DictConfig
 from typing import List, Dict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from cutie.inference.object_manager import ObjectManager
 from cutie.inference.kv_memory_store import KeyValueMemoryStore
@@ -110,30 +111,127 @@ class MemoryManager:
 
         return value
 
-    def read(self,
-             pix_feat: torch.Tensor,
-             query_key: torch.Tensor,
-             query_selection: torch.Tensor,
-             last_mask: torch.Tensor,
-             network: nn.Module,
-             **kwargs) -> tuple:
-        """
-        Read from the memory.
-        Returns the memory readout and auxiliary features.
-        """
-        if self.memory_key is None:
-            return None, None
+    def read(self, pix_feat: torch.Tensor, query_key: torch.Tensor, selection: torch.Tensor,
+             last_mask: torch.Tensor, network: CUTIE, **kwargs) -> Dict[int, torch.Tensor]:
+        
+        kinematics_data = kwargs 
+        h, w = pix_feat.shape[-2:]
+        bs = pix_feat.shape[0]
 
-        sensory = self.get_sensory(self.object_manager.all_obj_ids)
-        selector = self.get_selector(self.object_manager.all_obj_ids)
+        query_key = query_key.flatten(start_dim=2)  # bs*C^k*HW
+        selection = selection.flatten(start_dim=2)  # bs*C^k*HW
 
-        mem_readout, aux_output = network.read_memory(
-            query_key, query_selection, self.memory_key, self.memory_shrinkage,
-            self.memory_value, self.obj_memory, pix_feat, sensory, last_mask, selector,
-            **kwargs
-        )
+        all_readout_mem = {}
+        buckets = self.work_mem.buckets
+        for bucket_id, bucket in buckets.items():
+            
+            # 1. 提取密集的 Work Memory
+            work_key = self.work_mem.key[bucket_id]
+            work_shrink = self.work_mem.shrinkage[bucket_id]
 
-        return mem_readout, aux_output
+            grid = None
+            T = 0
+            if kinematics_data.get('use_depth_warp', False) and kinematics_data.get('depth_map') is not None:
+                from cutie.utils.kinematics_utils import depth_aware_warp, filter_realsense_depth
+                B, CK, N_work = work_key.shape
+                H_feat, W_feat = self.H, self.W
+                T = N_work // (H_feat * W_feat)
+                
+                if T > 0: # 確保有歷史幀
+                    filtered_depth, _ = filter_realsense_depth(kinematics_data['depth_map'])
+                    depth_down = F.interpolate(filtered_depth, size=(H_feat, W_feat), mode='nearest')
+                    se3_matrix = kinematics_data['se3_matrix']
+                    intrinsics = kinematics_data['intrinsics']
+                    
+                    se3_T = se3_matrix.repeat_interleave(T, dim=0) if se3_matrix.dim() == 3 else se3_matrix.view(B*T, 4, 4)
+                    
+                    # Warp Key
+                    work_key_spatial = work_key.view(B, CK, T, H_feat, W_feat).transpose(1, 2).reshape(B*T, CK, H_feat, W_feat)
+                    warped_key, grid = depth_aware_warp(work_key_spatial, depth_down.repeat_interleave(T, dim=0), 
+                                                        intrinsics.repeat_interleave(T, dim=0), se3_T, stride=16)
+                    work_key = warped_key.view(B, T, CK, H_feat, W_feat).transpose(1, 2).reshape(B, CK, N_work)
+                    
+                    # Warp Shrinkage
+                    shrink_spatial = work_shrink.view(B, 1, T, H_feat, W_feat).transpose(1, 2).reshape(B*T, 1, H_feat, W_feat)
+                    warped_shrink = F.grid_sample(shrink_spatial, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+                    work_shrink = warped_shrink.view(B, T, 1, H_feat, W_feat).transpose(1, 2).reshape(B, 1, N_work)
+            # =========================================================
+
+            # 2. 安全地與稀疏的 Long Memory 結合
+            if self.use_long_term and self.long_mem.engaged(bucket_id):
+                long_mem_size = self.long_mem.size(bucket_id)
+                memory_key = torch.cat([self.long_mem.key[bucket_id], work_key], -1)
+                shrinkage = torch.cat([self.long_mem.shrinkage[bucket_id], work_shrink], -1)
+            else:
+                long_mem_size = 0
+                memory_key = work_key
+                shrinkage = work_shrink
+
+            similarity = get_similarity(memory_key, shrinkage, query_key, selection)
+
+            if self.use_long_term and self.long_mem.engaged(bucket_id):
+                affinity, usage = do_softmax(similarity, top_k=self.top_k, inplace=True, return_usage=True)
+                work_usage = usage[:, long_mem_size:]
+                self.work_mem.update_bucket_usage(bucket_id, work_usage)
+                if self.count_long_term_usage:
+                    long_usage = usage[:, :long_mem_size]
+                    self.long_mem.update_bucket_usage(bucket_id, long_usage)
+            else:
+                if self.use_long_term:
+                    affinity, usage = do_softmax(similarity, top_k=self.top_k, inplace=True, return_usage=True)
+                    self.work_mem.update_bucket_usage(bucket_id, usage)
+                else:
+                    affinity = do_softmax(similarity, top_k=self.top_k, inplace=True)
+
+            object_chunks = [bucket] if self.chunk_size < 1 else [bucket[i:i + self.chunk_size] for i in range(0, len(bucket), self.chunk_size)]
+
+            for objects in object_chunks:
+                this_sensory = self._get_sensory_by_ids(objects)
+                this_last_mask = self._get_mask_by_ids(last_mask, objects)
+                this_msk_value = self._get_visual_values_by_ids(objects)
+
+                if grid is not None and T > 0:
+                    B_val, num_obj, CV, N_total = this_msk_value.shape
+                    N_work = T * self.H * self.W
+                    
+                    val_work = this_msk_value[..., -N_work:] # 取出最後的 Dense 特徵
+                    val_spatial = val_work.view(B_val, num_obj, CV, T, self.H, self.W)
+                    val_permuted = val_spatial.permute(0, 3, 1, 2, 4, 5).reshape(B_val*T, num_obj*CV, self.H, self.W)
+                    
+                    warped_val = F.grid_sample(val_permuted, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+                    warped_val = warped_val.view(B_val, T, num_obj, CV, self.H, self.W).permute(0, 2, 3, 1, 4, 5).reshape(B_val, num_obj, CV, N_work)
+                    
+                    # 重新拼回 Long Memory 部分
+                    this_msk_value = torch.cat([this_msk_value[..., :-N_work], warped_val], dim=-1)
+                # =========================================================
+
+                visual_readout = self._readout(affinity, this_msk_value).view(bs, len(objects), self.CV, h, w)
+                pixel_readout = network.pixel_fusion(pix_feat, visual_readout, this_sensory, this_last_mask)
+                
+                this_obj_mem = self._get_object_mem_by_ids(objects)
+                this_obj_mem = this_obj_mem.unsqueeze(2) if this_obj_mem is not None else None
+                
+                # 安全傳遞參數給 Object Transformer
+                use_shift = kinematics_data.get('use_explicit_shift', False)
+                shift_uv = kinematics_data.get('pixel_shift_uv', None)
+                try:
+                    readout_memory, aux_features = network.readout_query(pixel_readout, this_obj_mem, 
+                                                                         use_explicit_shift=use_shift, pixel_shift_uv=shift_uv)
+                except TypeError:
+                    readout_memory, aux_features = network.readout_query(pixel_readout, this_obj_mem)
+                
+                for i, obj in enumerate(objects):
+                    all_readout_mem[obj] = readout_memory[:, i]
+
+                if self.save_aux:
+                    self.aux = {
+                        'sensory': this_sensory,
+                        'pixel_readout': pixel_readout,
+                        'q_logits': aux_features['logits'] if aux_features else None,
+                        'attn_mask': aux_features['attn_mask'].float() if aux_features else None,
+                    }
+
+        return all_readout_mem
 
     def add_memory(self,
                    key: torch.Tensor,
